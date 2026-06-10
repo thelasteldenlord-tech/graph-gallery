@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>photo-graph</title>
+<script src="/d3.min.js"></script>
+<style>
+  :root{
+    --ink:#0c0e12;
+    --panel:#14171dee;
+    --line:#262b34;
+    --amber:#e8a33d;
+    --amber-dim:#8a6324;
+    --photo:#6ea8dc;
+    --text:#c8ceda;
+    --dim:#69707e;
+    --mono:ui-monospace,'Cascadia Mono','JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0}
+  html,body{height:100%}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:var(--mono);
+    overflow:hidden;
+  }
+  svg#stage{position:fixed;inset:0;width:100%;height:100%;cursor:grab}
+  svg#stage.dragging{cursor:grabbing}
+
+  /* ---- HUD ---- */
+  #hud{
+    position:fixed;top:16px;left:16px;z-index:10;
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:12px 16px;
+    max-width:320px;
+    backdrop-filter:blur(6px);
+  }
+  #hud .mark{
+    font-size:11px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--amber);margin-bottom:6px;
+  }
+  #hud .root{font-size:14px;color:var(--text);word-break:break-all}
+  #hud .stats{font-size:11px;color:var(--dim);margin-top:6px}
+  #hud .hint{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.6}
+  #hud .hint b{color:var(--text);font-weight:600}
+  #hud kbd{
+    border:1px solid var(--line);border-radius:4px;padding:0 4px;
+    font-family:inherit;font-size:10px;color:var(--text);
+  }
+
+  /* ---- graph ---- */
+  .link{stroke:var(--line);stroke-width:1.2}
+  .node{cursor:pointer}
+  .node text{
+    font-family:var(--mono);
+    fill:var(--dim);
+    pointer-events:none;
+    text-anchor:middle;
+  }
+  .node.folder text{fill:var(--text)}
+  .node .ring{fill:none}
+  .node.folder .ring{stroke:var(--amber-dim);stroke-width:2}
+  .node.folder.open .ring{stroke:var(--amber)}
+  .node.photo .ring{stroke:var(--line);stroke-width:1.5}
+  .node.photo:hover .ring{stroke:var(--photo)}
+  .node .halo{fill:none;opacity:0}
+  .node:hover .halo{opacity:1}
+  .node.loading .ring{stroke-dasharray:6 5;animation:spin 1.2s linear infinite}
+  @keyframes spin{to{stroke-dashoffset:-44}}
+  .node .badge{fill:var(--ink);stroke:var(--amber-dim);stroke-width:1}
+  .node .badge-t{fill:var(--amber);font-size:9px;text-anchor:middle;pointer-events:none}
+  .node .initial{fill:var(--amber);text-anchor:middle;pointer-events:none;font-weight:600}
+  .node circle.plate{fill:#1a1e26}
+
+  /* ---- lightbox ---- */
+  #lightbox{
+    position:fixed;inset:0;z-index:50;display:none;
+    background:#06070abf;backdrop-filter:blur(8px);
+    flex-direction:column;align-items:center;justify-content:center;gap:14px;
+  }
+  #lightbox.show{display:flex}
+  #lightbox img{
+    max-width:88vw;max-height:78vh;border-radius:6px;
+    border:1px solid var(--line);
+    box-shadow:0 0 60px #e8a33d22;
+    background:#000;
+  }
+  #lightbox .meta{font-size:12px;color:var(--text);text-align:center}
+  #lightbox .meta .path{color:var(--dim);font-size:11px;margin-top:4px}
+  #lightbox .nav{font-size:11px;color:var(--dim)}
+  #lightbox button{
+    position:absolute;top:18px;right:22px;
+    background:none;border:1px solid var(--line);border-radius:6px;
+    color:var(--text);font-family:var(--mono);font-size:12px;
+    padding:6px 12px;cursor:pointer;
+  }
+  #lightbox button:hover{border-color:var(--amber);color:var(--amber)}
+  :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){
+    .node.loading .ring{animation:none}
+  }
+  @media (max-width:600px){
+    #hud{max-width:calc(100vw - 32px)}
+    #hud .hint{display:none}
+  }
+</style>
+</head>
+<body>
+
+<svg id="stage" aria-label="photo directory graph"></svg>
+
+<div id="hud">
+  <div class="mark">photo-graph</div>
+  <div class="root" id="hud-root">loading…</div>
+  <div class="stats" id="hud-stats"></div>
+  <div class="hint">
+    <b>click</b> folder → expand / collapse<br>
+    <b>click</b> photo → view &nbsp;·&nbsp; <b>drag</b> to pin<br>
+    <b>scroll</b> zoom &nbsp;·&nbsp; <kbd>esc</kbd> close viewer
+  </div>
+</div>
+
+<div id="lightbox" role="dialog" aria-modal="true">
+  <button id="lb-close">esc ✕</button>
+  <img id="lb-img" alt="">
+  <div class="meta">
+    <div id="lb-name"></div>
+    <div class="path" id="lb-path"></div>
+  </div>
+  <div class="nav">← / → siblings</div>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+const svg = d3.select('#stage');
+const W = () => window.innerWidth, H = () => window.innerHeight;
+
+// zoomable scene
+const scene = svg.append('g');
+const linkLayer = scene.append('g');
+const nodeLayer = scene.append('g');
+const defs = svg.append('defs');
+
+// amber safelight halo gradient
+const grad = defs.append('radialGradient').attr('id','halo');
+grad.append('stop').attr('offset','55%').attr('stop-color','#e8a33d').attr('stop-opacity',0);
+grad.append('stop').attr('offset','100%').attr('stop-color','#e8a33d').attr('stop-opacity',0.18);
+
+const zoom = d3.zoom()
+  .scaleExtent([0.08, 6])
+  .on('zoom', (ev) => {
+    scene.attr('transform', ev.transform);
+    // fade photo labels when zoomed far out
+    nodeLayer.selectAll('.node.photo text')
+      .attr('opacity', ev.transform.k < 0.55 ? 0 : 1);
+  });
+svg.call(zoom);
+
+// ---------- state ----------
+const nodes = [];            // {id,type,name,path,hasIcon,folderCount,photoCount,open,loaded,parent,r,x,y}
+const links = [];            // {source,target}
+const byId = new Map();
+
+const sim = d3.forceSimulation(nodes)
+  .force('link', d3.forceLink(links).id(d => d.id)
+      .distance(l => l.target.type === 'photo' ? 70 : 130)
+      .strength(0.9))
+  .force('charge', d3.forceManyBody().strength(d => d.type === 'folder' ? -480 : -120))
+  .force('collide', d3.forceCollide().radius(d => d.r + 8).strength(0.9))
+  .force('x', d3.forceX().strength(0.015))
+  .force('y', d3.forceY().strength(0.015))
+  .on('tick', tick);
+
+function folderRadius(d){
+  return Math.max(18, Math.min(42, 15 + Math.sqrt(d.folderCount * 9 + d.photoCount * 3) * 2.4));
+}
+const PHOTO_R = 14;
+
+function addFolderNode(info, parent){
+  if (byId.has('F:' + info.path)) return byId.get('F:' + info.path);
+  const n = {
+    id: 'F:' + info.path, type: 'folder',
+    name: info.name, path: info.path,
+    hasIcon: info.hasIcon, folderCount: info.folderCount ?? 0, photoCount: info.photoCount ?? 0,
+    open: false, loaded: false, parent,
+    x: (parent?.x ?? 0) + (Math.random() - 0.5) * 60,
+    y: (parent?.y ?? 0) + (Math.random() - 0.5) * 60,
+  };
+  n.r = folderRadius(n);
+  nodes.push(n); byId.set(n.id, n);
+  if (parent) links.push({ source: parent.id, target: n.id });
+  return n;
+}
+
+function addPhotoNode(info, parent){
+  if (byId.has('P:' + info.path)) return byId.get('P:' + info.path);
+  const n = {
+    id: 'P:' + info.path, type: 'photo',
+    name: info.name, path: info.path, parent, r: PHOTO_R,
+    x: parent.x + (Math.random() - 0.5) * 40,
+    y: parent.y + (Math.random() - 0.5) * 40,
+  };
+  nodes.push(n); byId.set(n.id, n);
+  links.push({ source: parent.id, target: n.id });
+  return n;
+}
+
+function removeDescendants(folder){
+  const doomed = new Set();
+  (function walk(p){
+    for (const n of nodes){
+      if (n.parent === p && !doomed.has(n)) { doomed.add(n); if (n.type === 'folder') walk(n); }
+    }
+  })(folder);
+  for (let i = nodes.length - 1; i >= 0; i--){
+    if (doomed.has(nodes[i])) { byId.delete(nodes[i].id); nodes.splice(i, 1); }
+  }
+  for (let i = links.length - 1; i >= 0; i--){
+    const t = links[i].target;
+    if (doomed.has(typeof t === 'object' ? t : byId.get(t))) links.splice(i, 1);
+  }
+}
+
+// ---------- data ----------
+async function fetchTree(relPath){
+  const r = await fetch('/api/tree?path=' + encodeURIComponent(relPath));
+  if (!r.ok) throw new Error('tree fetch failed');
+  return r.json();
+}
+
+async function expand(folder){
+  if (folder.open) { // collapse
+    folder.open = false;
+    removeDescendants(folder);
+    refresh();
+    return;
+  }
+  folder.loading = true; refresh();
+  try {
+    const data = await fetchTree(folder.path);
+    folder.hasIcon = data.hasIcon;
+    folder.open = true; folder.loaded = true;
+    for (const f of data.folders) addFolderNode(f, folder);
+    for (const p of data.photos)  addPhotoNode(p, folder);
+  } catch (e){ console.error(e); }
+  folder.loading = false;
+  refresh();
+}
+
+// ---------- render ----------
+function refresh(){
+  // links
+  linkLayer.selectAll('line.link')
+    .data(links, l => (l.source.id ?? l.source) + '→' + (l.target.id ?? l.target))
+    .join('line').attr('class','link');
+
+  // nodes
+  const sel = nodeLayer.selectAll('g.node').data(nodes, d => d.id);
+
+  const ent = sel.enter().append('g')
+    .attr('class', d => 'node ' + d.type)
+    .call(d3.drag()
+      .on('start', (ev,d) => { if(!ev.active) sim.alphaTarget(0.25).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag',  (ev,d) => { d.fx = ev.x; d.fy = ev.y; })
+      .on('end',   (ev,d) => { if(!ev.active) sim.alphaTarget(0); /* stays pinned */ }))
+    .on('dblclick', (ev,d) => { d.fx = null; d.fy = null; ev.stopPropagation(); }) // unpin
+    .on('click', (ev,d) => {
+      if (ev.defaultPrevented) return;
+      if (d.type === 'folder') expand(d);
+      else openLightbox(d);
+    });
+
+  ent.append('circle').attr('class','halo').attr('fill','url(#halo)');
+  ent.append('circle').attr('class','plate');
+
+  // clipped node image: thisnode.png for folders that have one, the photo itself for photos
+  ent.each(function(d){
+    const g = d3.select(this);
+    const clipId = 'clip-' + d.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    defs.append('clipPath').attr('id', clipId)
+        .append('circle').attr('r', d.r - (d.type === 'folder' ? 2 : 1.5));
+    if (d.type === 'photo' || d.hasIcon){
+      const src = d.type === 'photo'
+        ? '/img?path=' + encodeURIComponent(d.path)
+        : '/img?path=' + encodeURIComponent((d.path ? d.path + '/' : '') + 'thisnode.png');
+      g.append('image')
+        .attr('href', src)
+        .attr('clip-path', `url(#${clipId})`)
+        .attr('preserveAspectRatio','xMidYMid slice')
+        .attr('decoding','async');
+    } else {
+      g.append('text').attr('class','initial')
+        .attr('dy','0.36em')
+        .attr('font-size', d.r * 0.9)
+        .text((d.name || '?').charAt(0).toUpperCase());
+    }
+  });
+
+  ent.append('circle').attr('class','ring');
+
+  // count badge on collapsed folders with content
+  ent.filter(d => d.type === 'folder').each(function(d){
+    const g = d3.select(this);
+    g.append('circle').attr('class','badge').attr('r', 9);
+    g.append('text').attr('class','badge-t').attr('dy','0.34em');
+  });
+
+  ent.append('text').attr('class','label')
+    .attr('font-size', d => d.type === 'folder' ? 12 : 10);
+
+  const all = ent.merge(sel);
+  sel.exit().each(function(d){
+    d3.select('#clip-' + d.id.replace(/[^a-zA-Z0-9_-]/g, '_')).remove();
+  }).remove();
+
+  all.attr('class', d =>
+      'node ' + d.type + (d.open ? ' open' : '') + (d.loading ? ' loading' : ''));
+  all.select('.halo').attr('r', d => d.r * 1.8);
+  all.select('.plate').attr('r', d => d.r - 1);
+  all.select('.ring').attr('r', d => d.r);
+  all.select('image')
+    .attr('x', d => -d.r).attr('y', d => -d.r)
+    .attr('width', d => d.r * 2).attr('height', d => d.r * 2);
+  all.select('.label')
+    .attr('y', d => d.r + 15)
+    .text(d => d.name);
+  all.select('.badge')
+    .attr('cx', d => d.r * 0.72).attr('cy', d => -d.r * 0.72)
+    .attr('display', d => !d.open && (d.folderCount + d.photoCount) > 0 ? null : 'none');
+  all.select('.badge-t')
+    .attr('x', d => d.r * 0.72).attr('y', d => -d.r * 0.72)
+    .attr('display', d => !d.open && (d.folderCount + d.photoCount) > 0 ? null : 'none')
+    .text(d => d.folderCount + d.photoCount);
+
+  sim.nodes(nodes);
+  sim.force('link').links(links);
+  sim.alpha(0.6).restart();
+  updateHud();
+}
+
+function tick(){
+  linkLayer.selectAll('line.link')
+    .attr('x1', l => l.source.x).attr('y1', l => l.source.y)
+    .attr('x2', l => l.target.x).attr('y2', l => l.target.y);
+  nodeLayer.selectAll('g.node')
+    .attr('transform', d => `translate(${d.x},${d.y})`);
+}
+
+function updateHud(){
+  const f = nodes.filter(n => n.type === 'folder').length;
+  const p = nodes.filter(n => n.type === 'photo').length;
+  document.getElementById('hud-stats').textContent =
+    `${f} folder${f===1?'':'s'} · ${p} photo${p===1?'':'s'} on graph`;
+}
+
+// ---------- lightbox ----------
+const lb = document.getElementById('lightbox');
+const lbImg = document.getElementById('lb-img');
+let lbNode = null;
+
+function siblings(n){
+  return nodes.filter(x => x.type === 'photo' && x.parent === n.parent);
+}
+function openLightbox(n){
+  lbNode = n;
+  lbImg.src = '/img?path=' + encodeURIComponent(n.path);
+  lbImg.alt = n.name;
+  document.getElementById('lb-name').textContent = n.name;
+  document.getElementById('lb-path').textContent = '/' + n.path;
+  lb.classList.add('show');
+}
+function closeLightbox(){ lb.classList.remove('show'); lbNode = null; lbImg.src = ''; }
+function step(dir){
+  if (!lbNode) return;
+  const sibs = siblings(lbNode);
+  const i = sibs.indexOf(lbNode);
+  openLightbox(sibs[(i + dir + sibs.length) % sibs.length]);
+}
+document.getElementById('lb-close').addEventListener('click', closeLightbox);
+lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
+window.addEventListener('keydown', e => {
+  if (!lb.classList.contains('show')) return;
+  if (e.key === 'Escape') closeLightbox();
+  if (e.key === 'ArrowRight') step(1);
+  if (e.key === 'ArrowLeft') step(-1);
+});
+
+// ---------- boot ----------
+(async () => {
+  svg.call(zoom.transform, d3.zoomIdentity.translate(W()/2, H()/2));
+  try {
+    const rootData = await fetchTree('');
+    document.getElementById('hud-root').textContent = '/' + rootData.name;
+    const root = addFolderNode(
+      { name: rootData.name, path: '', hasIcon: rootData.hasIcon,
+        folderCount: rootData.folders.length, photoCount: rootData.photos.length },
+      null);
+    root.fx = 0; root.fy = 0;        // anchor the root
+    root.open = true; root.loaded = true;
+    for (const f of rootData.folders) addFolderNode(f, root);
+    for (const p of rootData.photos)  addPhotoNode(p, root);
+    refresh();
+  } catch (e){
+    document.getElementById('hud-root').textContent = 'failed to load root — is the server pointed at a readable directory?';
+    console.error(e);
+  }
+})();
+
+window.addEventListener('resize', () => sim.alpha(0.2).restart());
+})();
+</script>
+</body>
+</html>
